@@ -1,0 +1,9 @@
+{
+    "intent": "QueryCount | QueryPresence | QueryLocation | DescribeScene | SetAlert",
+    "object": "person|dog|car|…",
+    "region": "left|center|right|top|bottom|null",
+    "threshold": 0.5,
+    "color": null,
+    "min_count": 1
+  }
+  

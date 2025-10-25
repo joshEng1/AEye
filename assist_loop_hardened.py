@@ -501,6 +501,9 @@ def main():
                 except (EOFError, KeyboardInterrupt):
                     break
 
+                # Clear any pending TTS messages from previous interactions
+                tts.clear_queue()
+
                 # If typing mode and user already typed a question on this line, use it.
                 if (mode == "typing") and line.strip():
                     cmd = line.strip()
@@ -550,6 +553,10 @@ def main():
                         _ = signal_q.get(timeout=0.5)
                     except queue.Empty:
                         continue
+                    
+                    # Clear any pending TTS messages from previous interactions
+                    tts.clear_queue()
+                    
                     if args.debug: print("[triggered]")
                     cmd = capture_command(mode, tts, in_dev=args.in_dev, mic_index=args.mic_index, 
                                         fast_mode=args.fast, energy_threshold=args.energy, debug=args.debug)

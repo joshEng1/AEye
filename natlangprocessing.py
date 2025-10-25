@@ -182,7 +182,7 @@ def exec_query_count(frame, slots):
 def exec_query_location(frame, slots):
     objs = filter_dets(frame, label=slots["object"], threshold=slots["threshold"])
     if not objs:
-        return f"I don’t see a {slots['object'] or 'target'}."
+        return f"I don't see a {slots['object'] or 'target'}."
     def score(d):
         w, h = d.get("img_w", CONFIG["IMG_W"]), d.get("img_h", CONFIG["IMG_H"])
         cx = (d["box"][0]+d["box"][2])/2; cy = (d["box"][1]+d["box"][3])/2
@@ -190,20 +190,41 @@ def exec_query_location(frame, slots):
         return (d["conf"], -ex)
     best = max(objs, key=score)
     h, v = region_of(best["box"], best.get("img_w", CONFIG["IMG_W"]), best.get("img_h", CONFIG["IMG_H"]))
-    return f"The {best['label']} is {h}-{v}."
+    
+    # Enhanced description with natural language
+    if len(objs) == 1:
+        position = f"on the {h}" if v == "top" else f"on the {h} at the {v}"
+        return f"The {best['label']} is {position}."
+    else:
+        position = f"on the {h}" if v == "top" else f"on the {h} at the {v}"
+        return f"I see {len(objs)} {_pluralize(best['label'], len(objs))}. The closest one is {position}."
 
 def exec_describe_scene(frame, slots):
     keep = [d for d in frame if d.get("conf",0.0) >= slots["threshold"]]
     if not keep:
-        return "I don’t see anything with enough confidence."
+        return "I don't see anything with enough confidence."
     counts = Counter(d["label"] for d in keep)
     lr_counts = Counter()
     for d in keep:
         h, _ = region_of(d["box"], d.get("img_w", CONFIG["IMG_W"]), d.get("img_h", CONFIG["IMG_H"]))
         lr_counts[h] += 1
-    parts = [f"{lbl}: {cnt}" for lbl, cnt in counts.most_common(3)]
-    spatial = f" (left:{lr_counts['left']}, center:{lr_counts['center']}, right:{lr_counts['right']})"
-    return "I see " + ", ".join(parts) + "." + spatial
+    
+    # Main objects description
+    parts = [f"{cnt} {_pluralize(lbl, cnt)}" for lbl, cnt in counts.most_common(3)]
+    
+    # Spatial distribution (only if useful)
+    spatial_desc = ""
+    if lr_counts['left'] > 0 or lr_counts['right'] > 0 or lr_counts['center'] > 0:
+        locations = []
+        if lr_counts['left'] > 0:
+            locations.append(f"{lr_counts['left']} on left")
+        if lr_counts['center'] > 0:
+            locations.append(f"{lr_counts['center']} in center")
+        if lr_counts['right'] > 0:
+            locations.append(f"{lr_counts['right']} on right")
+        spatial_desc = " (" + ", ".join(locations) + ")"
+    
+    return "I see " + ", ".join(parts) + "." + spatial_desc
 
 def exec_set_alert(slots):
     spec = {

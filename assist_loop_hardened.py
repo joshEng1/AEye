@@ -25,6 +25,16 @@ except Exception:
     sd = None
 
 from natlangprocessing import CONFIG, TemporalBuffer, handle_command_over_buffer
+
+# Try to load enhanced NLP with semantic matching (optional)
+try:
+    from nlp_enhanced import enhanced_handle_command
+    print("[nlp] Enhanced semantic matching enabled!")
+    USE_SEMANTIC = True
+except Exception as e:
+    print(f"[nlp] Semantic matching not available ({e}), using basic NLP")
+    USE_SEMANTIC = False
+
 import mock_yolo as my
 
 # ---- Fault handling / logs ----
@@ -108,12 +118,27 @@ class TTSWorker:
             try:
                 self.engine.say(msg)
                 self.engine.runAndWait()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[TTS Worker Error] {e}")
+                import traceback
+                traceback.print_exc()
 
     def say(self, text: str):
         if not self._stop.is_set():
             self.q.put(text)
+            print(f"[TTS] Queued: '{text[:50]}...' (queue size: {self.q.qsize()})")
+    
+    def clear_queue(self):
+        """Clear all pending TTS messages"""
+        cleared = 0
+        while not self.q.empty():
+            try:
+                self.q.get_nowait()
+                cleared += 1
+            except queue.Empty:
+                break
+        if cleared > 0:
+            print(f"[TTS] Cleared {cleared} pending message(s)")
 
     def close(self):
         self._stop.set()
@@ -156,8 +181,10 @@ def record_via_sounddevice(seconds=5, fs=16000, device=None):
         raise RuntimeError("sounddevice not available")
     if device is not None:
         sd.default.device = (device, None)
+    print(f"🎤 Recording for {seconds} seconds... Speak now!")
     audio = sd.rec(int(seconds*fs), samplerate=fs, channels=1, dtype='int16', device=device)
     sd.wait()
+    print("✓ Recording complete, processing...")
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(fs)
@@ -265,24 +292,19 @@ def feed_yolo_from_stream(tb, stream_iter, stop_evt, fps=CONFIG["FPS"], debug=Fa
         time.sleep(period * 0.2)
 
 # ---------------- Capture command (mic or typing) ----------------
-def capture_command(mode: str, tts: TTSWorker, in_dev=None, mic_index=None, debug: bool=False) -> str:
-    """
-    Returns a command string from user via:
-      - mode == "sd": record with sounddevice, run SpeechRecognition on the WAV bytes
-      - mode == "mic": use SpeechRecognition Microphone (PyAudio backend)
-      - mode == "typing": prompt for typed input
-    Falls back to typing on any audio/STT error.
-    """
-    # sounddevice -> SpeechRecognition path (no PyAudio)
+def capture_command(mode: str, tts: TTSWorker, in_dev=None, mic_index=None, fast_mode=False, energy_threshold=None, debug=False) -> str:
+    # sounddevice -> SpeechRecognition
     if mode == "sd" and sr is not None and sd is not None:
         try:
-            tts.say("Listening.")
+            if not fast_mode:
+                tts.say("Listening.")
             wav_bytes = record_via_sounddevice(seconds=5, device=in_dev)
             with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
                 r = sr.Recognizer()
                 audio = r.record(source)
             text = recognize_with_timeout(r, audio, timeout_s=7.0)
             if debug: print(f"[heard/sd] {text}")
+            print(f"[you] {text}")
             return text
         except TimeoutError:
             tts.say("Sorry, that took too long. Please type it.")
@@ -293,32 +315,71 @@ def capture_command(mode: str, tts: TTSWorker, in_dev=None, mic_index=None, debu
         except Exception as e:
             if debug: print("[sd error]", e)
 
-    # PyAudio Microphone path (SpeechRecognition)
+    # PyAudio Microphone path
     if mode == "mic" and sr is not None:
         try:
             r = sr.Recognizer()
+            r.dynamic_energy_threshold = (energy_threshold is None)  # Only auto if not manual
+            
             with sr.Microphone(device_index=mic_index) as source:
-                tts.say("Listening.")
-                r.adjust_for_ambient_noise(source, duration=0.25)
-                audio = r.listen(source, timeout=5, phrase_time_limit=6)
+                if not fast_mode:
+                    print("🎤 Listening...")
+                else:
+                    print("🎤")  # Minimal feedback even in fast mode
+                    
+                if debug:
+                    print(f"[mic] Adjusting for ambient noise...")
+                    
+                # Calibrate if using auto threshold
+                if energy_threshold is None:
+                    r.adjust_for_ambient_noise(source, duration=0.5)
+                else:
+                    r.energy_threshold = energy_threshold
+                
+                if debug:
+                    print(f"[mic] Energy threshold: {r.energy_threshold}")
+                    print(f"[mic] Waiting for speech...")
+                    
+                audio = r.listen(source, timeout=10, phrase_time_limit=10)
+                
+            print("🔄 Processing...")
             text = recognize_with_timeout(r, audio, timeout_s=7.0)
             if debug: print(f"[heard/mic] {text}")
+            print(f"[you] {text}")
             return text
+        except sr.WaitTimeoutError:
+            print("⏱️ Timeout - no speech detected")
+            tts.say("I didn't hear anything. Press Enter to try again.")
+            return ""
         except TimeoutError:
-            tts.say("Sorry, that took too long. Please type it.")
+            print("⏱️ Recognition timeout")
+            tts.say("That took too long. Press Enter to try again.")
+            return ""
         except sr.UnknownValueError:
-            tts.say("Sorry, I didn’t catch that. Please type it.")
-        except sr.RequestError:
-            tts.say("Speech service unavailable. Type your command.")
+            print("❓ Could not understand audio")
+            tts.say("I didn't catch that. Press Enter to try again.")
+            return ""
+        except sr.RequestError as e:
+            print(f"🌐 Speech service error: {e}")
+            tts.say("Speech service unavailable. Press Enter to try again.")
+            return ""
         except Exception as e:
-            if debug: print("[mic error]", e)
+            if debug: print(f"[mic error] {e}")
+            tts.say("Microphone error. Press Enter to try again.")
+            return ""
 
-    # typing fallback (or if mode == "typing")
-    tts.say("Type your command and press Enter.")
-    try:
-        return input("> ").strip()
-    except EOFError:
-        return ""
+    # typing fallback (only if in typing mode)
+    if mode == "typing":
+        try:
+            val = input("> ").strip()
+            print(f"[you] {val}")
+            return val
+        except EOFError:
+            return ""
+    
+    # If mic/sd failed, return empty instead of blocking
+    return ""
+
 
 # ---------------- Main ----------------
 def main():
@@ -328,10 +389,18 @@ def main():
     ap.add_argument("--scenario", choices=["person_lr","blink_dog","crowd_car","empty"], default="crowd_car")
     ap.add_argument("--stt", choices=["mic","sd","typing"], default=None,
                     help="mic=PyAudio Microphone; sd=sounddevice; typing=manual")
-    ap.add_argument("--trigger", choices=["ctrlq","f9","enter"], default="ctrlq",
+    ap.add_argument("--trigger", choices=["ctrlq","f9","enter"], default="enter",
                     help="how to trigger listening")
     ap.add_argument("--in-dev", type=int, default=None, help="sounddevice input device index")
     ap.add_argument("--mic-index", type=int, default=None, help="SpeechRecognition Microphone device_index")
+    ap.add_argument("--model", type=str, default="yolov8n.pt", 
+                    help="YOLO model: yolov8n.pt (fast), yolov8s.pt (balanced), yolov8m.pt (accurate)")
+    ap.add_argument("--confidence", type=float, default=0.5,
+                    help="detection confidence threshold (0.0-1.0), lower=more detections")
+    ap.add_argument("--energy", type=int, default=300,
+                    help="microphone energy threshold (lower=more sensitive), default=500")
+    ap.add_argument("--fast", action="store_true",
+                    help="skip 'Listening' audio cue for faster response")
     ap.add_argument("--list-devices", action="store_true", help="list input devices and exit")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
@@ -391,8 +460,10 @@ def main():
         # Try to import real YOLO adapter; if missing, fall back to mock
         try:
             from yolo_integration import yolo_stream
+            print(f"[info] Using model: {args.model}, confidence threshold: {args.confidence}")
             stream = yolo_stream(cap_index=0, size=(CONFIG["IMG_W"], CONFIG["IMG_H"]),
-                                 model_path="yolov8n.pt", conf_threshold=0.5, stop_evt=stop_evt)
+                                 model_path=args.model, conf_threshold=args.confidence, 
+                                 stop_evt=stop_evt, show_window=True)
             feeder = threading.Thread(
                 target=feed_yolo_from_stream,
                 args=(tb, iter(stream), stop_evt, CONFIG["FPS"], args.debug, tts),
@@ -433,9 +504,11 @@ def main():
                 # If typing mode and user already typed a question on this line, use it.
                 if (mode == "typing") and line.strip():
                     cmd = line.strip()
+                    print(f"[you] {cmd}")  # <-- echo typed line captured directly
                 else:
                     if args.debug: print("[triggered]")
-                    cmd = capture_command(mode, tts, in_dev=args.in_dev, mic_index=args.mic_index, debug=args.debug)
+                    cmd = capture_command(mode, tts, in_dev=args.in_dev, mic_index=args.mic_index, 
+                                        fast_mode=args.fast, energy_threshold=args.energy, debug=args.debug)
 
                 if not cmd:
                     continue
@@ -449,9 +522,22 @@ def main():
                 if low in SPEAK_CLOSEST_ALIASES:
                     speak_closest_tts(tts, tb); continue
 
-                reply = handle_command_over_buffer(cmd, tb)
+                # Use enhanced semantic matching if available
+                if USE_SEMANTIC:
+                    reply = enhanced_handle_command(cmd, tb, debug=args.debug)
+                else:
+                    reply = handle_command_over_buffer(cmd, tb)
+                    
                 print(f"[answer] {reply}")
-                tts.say(reply)
+                
+                # Ensure TTS says the reply
+                try:
+                    tts.say(reply)
+                    if args.debug:
+                        print("[tts] Speaking...")
+                except Exception as e:
+                    print(f"[tts error] {e}")
+                    
                 time.sleep(0.2)  # debounce
 
         else:
@@ -465,7 +551,8 @@ def main():
                     except queue.Empty:
                         continue
                     if args.debug: print("[triggered]")
-                    cmd = capture_command(mode, tts, in_dev=args.in_dev, mic_index=args.mic_index, debug=args.debug)
+                    cmd = capture_command(mode, tts, in_dev=args.in_dev, mic_index=args.mic_index, 
+                                        fast_mode=args.fast, energy_threshold=args.energy, debug=args.debug)
                     if not cmd:
                         continue
 
@@ -477,9 +564,22 @@ def main():
                     if low in SPEAK_CLOSEST_ALIASES:
                         speak_closest_tts(tts, tb); continue
 
-                    reply = handle_command_over_buffer(cmd, tb)
+                    # Use enhanced semantic matching if available
+                    if USE_SEMANTIC:
+                        reply = enhanced_handle_command(cmd, tb, debug=args.debug)
+                    else:
+                        reply = handle_command_over_buffer(cmd, tb)
+                        
                     print(f"[answer] {reply}")
-                    tts.say(reply)
+                    
+                    # Ensure TTS says the reply
+                    try:
+                        tts.say(reply)
+                        if args.debug:
+                            print("[tts] Speaking...")
+                    except Exception as e:
+                        print(f"[tts error] {e}")
+                        
                     time.sleep(0.2)
             finally:
                 try: stop_hotkey()
